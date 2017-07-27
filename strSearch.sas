@@ -33,6 +33,10 @@
 *   ----------------------------------------------------------------------------
 *   FILETYPE: The extension name of the target file. Case insensitive.
 *   ----------------------------------------------------------------------------
+*   RECURSIVE: Whether or not to perform recursive search. A recursive search is,
+*     when file A matches any search string, and file B contains the name of file
+*     A then file B is included in the report.
+*   ----------------------------------------------------------------------------
 *   SEARCHSTR1-10: Target string to be searched among target files.
 *   ----------------------------------------------------------------------------
 *   EXCLUDESTR1-10: Strings to be excluded. This is used in pair with SEARCHSTR.
@@ -79,7 +83,9 @@
 %macro parse_searchstr(searchStr_in, mvar_searchStr_out, mvar_reg_exp, mvar_case_sens);
 
 %local pattern;
-%let pattern = ^([''""])(.+\1)(\s+[Y|N])?(\s+[Y|N])?$; ** pattern of search string in regular expression ;
+
+/* pattern of search string in regular expression */
+%let pattern = ^([''""])(.+\1)(\s+[Y|N])?(\s+[Y|N])?$; 
 
 %local ___searchStr;
 %local ___regExp;
@@ -118,7 +124,16 @@
 
 
 
-%macro strSearchKNL(infile=, searchStr=, search_case_sense=, search_reg_exp=, excludeStr=, exclude_case_sense=, exclude_reg_exp=);
+%macro strSearchKNL(
+  infile             =
+ ,searchStr          =
+ ,search_case_sense  =
+ ,search_reg_exp     =
+ ,excludeStr         =
+ ,exclude_case_sense =
+ ,exclude_reg_exp    =
+);
+
   %local rc;
   %local filrf;
   %local seachStrPRX;
@@ -183,8 +198,8 @@
 %macro strSearch( dir=
                  ,filenamePattern = 
                  ,filetype =
-                 ,includeSubFolder =
-                 ,displayLineNum = Y 
+                 ,includeSubFolder = N
+                 ,recursive = N
                  ,searchStr  =, excludeStr  =
                  ,searchStr1 =, excludeStr1 =
                  ,searchStr2 =, excludeStr2 =
@@ -213,8 +228,17 @@
 
 %let workdir = %qsysfunc(pathname(work));
 
+%let recursive = %upcase(&recursive);
+%let includeSubFolder = %upcase(&includeSubFolder);
+
+%if %length(&recursive) = 0 %then %let recursive = N;
+%else %let recursive = %substr(&recursive, 1, 1);
+
+%if %length(&includeSubFolder) = 0 %then %let includeSubFolder = N;
+%else %let includeSubFolder = %substr(&includeSubFolder, 1, 1);
+
 *************************************************************************************;
-* Get a list of file names according to user input 
+* Get a list of file names according to user input                                   ;
 *************************************************************************************;
 option noxwait xsync;
 
@@ -264,11 +288,11 @@ data files;
 run;
 
 *************************************************************************************;
-* In case of filetype is specified, macro getFileNames returns file names of which file
-* type suffix containing user input (filetype). But in this macro, we only need file of
-* which file type suffix precisely matched user input.
-* If user specified filenamePatttern, it cannot be processed by macro getFileNames, this
-* filter is done below.
+* In case of filetype is specified, macro getFileNames returns file names of which   ;
+* file type suffix containing user input (filetype). But in this macro, we only need ;
+* file of which file type suffix precisely matched user input.                       ;
+* If user specified filenamePatttern, it cannot be processed by macro getFileNames,  ;
+* this filter is done below.                                                         ;
 *************************************************************************************;
 proc sort data=files;
   by directory filename;
@@ -278,7 +302,8 @@ proc sort data=files;
   %end;
   %if %length(&filenamePattern) > 0 %then %do;
   %let filenamePattern = %sysfunc(prxchange(s/[""]/""/, -1, &filenamePattern));
-  and prxmatch("/&filenamePattern/i", strip(filename)) /* on windows, file name is case-insensitive */
+  /* on windows, file name is case-insensitive */
+  and prxmatch("/&filenamePattern/i", strip(filename)) 
   %end;
   ;
 run;
@@ -297,8 +322,12 @@ data matchFiles;
 run;
 
 
-%if %length(&searchStr) > 0 and %length(&searchStr1) = 0 %then %let searchStr1 = &searchStr;
-%if %length(&excludeStr) > 0 and %length(&excludeStr1) = 0 %then %let excludeStr1 = &excludeStr;
+%if %length(&searchStr) > 0 and %length(&searchStr1) = 0 %then %do;
+  %let searchStr1 = &searchStr;
+%end;
+%if %length(&excludeStr) > 0 and %length(&excludeStr1) = 0 %then %do;
+  %let excludeStr1 = &excludeStr;
+%end;
 
 %do i = 1 %to 10;
   %local _searchStr&i;
@@ -317,29 +346,92 @@ run;
 %end;
 
 
-%do i=1 %to &nfiles;
+%do i=1 %to &nFiles;
   data _null_;
     set files (firstobs=&i obs=&i);
     call symput('file', strip(directory)||'\'||strip(filename));
   run;
-
   %do j = 1 %to 10;
     %if %length(&&searchStr&j) > 0 %then %do;
     ***************************************************************************;
-    * Macro strSearchKNL returns search results in a dataset called _matchFile
-    * who has same structure as master dataset matchFiles.
+    * Macro strSearchKNL returns search results in a dataset called _matchFile ;
+    * who has same structure as master dataset matchFiles.                     ;
     ***************************************************************************;
       %strSearchKNL(
-	    infile             = &file
-	   ,searchStr          = &&_searchStr&j
-	   ,search_case_sense  = &&_s_case&j
-	   ,search_reg_exp     = &&_s_reg&j
-	   ,excludeStr         = &&_excludeStr&j
-	   ,exclude_case_sense = &&_e_case&j
-	   ,exclude_reg_exp    = &&_e_reg&j
+        infile             = &file
+       ,searchStr          = &&_searchStr&j
+       ,search_case_sense  = &&_s_case&j
+       ,search_reg_exp     = &&_s_reg&j
+       ,excludeStr         = &&_excludeStr&j
+       ,exclude_case_sense = &&_e_case&j
+       ,exclude_reg_exp    = &&_e_reg&j
        );
       proc append base=matchFiles data=_matchFile; run;
     %end;
+  %end;
+%end;
+
+***************************************************************************;
+* In case of recursive search -  the matched file name is searched         ;
+***************************************************************************;
+%if &recursive = Y %then %do;
+  %local _nFilesNew;  
+  %local _sFile;
+  %let _newFiles = 0;
+
+  proc sort data=matchFiles nodupkey out=_newFiles(keep=file); by file; run;
+  proc sort data=matchFiles nodupkey out=_oldFiles(keep=file); by file; run;
+  proc sql noprint;
+    select count(*)
+    into: _nFilesNew
+    from _newFiles
+    ;
+  quit;
+
+  %do %while(&_nFilesNew > 0);
+    %do i = 1 %to &nFiles;
+      data _null_;
+        set files (firstobs=&i obs=&i);
+        call symput('file', strip(directory)||'\'||strip(filename));
+      run;
+      %do j = 1 %to &_nFilesNew.;
+        data _null_;
+          set _newFiles(firstobs=&j obs=&j);
+          call symput('_sFile', strip(file));
+        run;
+        %strSearchKNL(
+          infile             = &file
+         ,searchStr          = "&_sFile"
+         ,search_case_sense  = N
+         ,search_reg_exp     = N
+         );
+
+        ** No need to include self;
+        proc sql;
+          delete *
+          from _matchFile
+          where upcase(file) = %upcase("&_sFile")
+          ;
+        quit;
+        proc append base=matchFiles data=_matchFile; run;
+      %end;
+    %end;
+    proc sort data=matchFiles nodupkey out=_mFilesNew(keep=file); by file; run;
+    data _newFiles;
+      merge _oldFiles  (in=__old)
+            _mFilesNew (in=__new) 
+      ;by file;
+      if not __old;
+    run;
+    proc sort data=matchFiles nodupkey out=_oldFiles(keep=file); by file; run;
+
+    %let _nFilesNew = 0;
+    proc sql noprint;
+      select count(*)
+      into: _nFilesNew
+      from _newFiles
+      ;
+    quit;
   %end;
 %end;
 
@@ -365,32 +457,42 @@ data _null_;
 run;
 
 ***************************************************************************;
-* Create a summary header in the search result output file.
+* Create a summary header in the search result output file.                ;
 ***************************************************************************;
 
- data _title;
+ data _title;      
    length title $256;
    title="Root Directory: &dir"; output;
    title="Include Subfolder: %upcase(&includeSubFolder)"; output;
-   title="Target File Type: &filetype" %if %length(&filetype) = 0 %then||' NOT SEPCIFIED';;output;
-   title="Target File Name Pattern: &filenamePattern" %if %length(&filenamePattern) = 0 %then ||' NOT SEPCIFIED';;output;
-   title="# of Target Files: &nfiles";output;
+   title="Target File Type: &filetype" 
+     %if %length(&filetype) = 0 %then %do;
+      ||' NOT SEPCIFIED';
+     %end;
+     ;output;
+   title="Target File Name Pattern: &filenamePattern" 
+     %if %length(&filenamePattern) = 0 %then %do;
+       ||' NOT SEPCIFIED';
+     %end;
+     ;output;
+   title="Recursive Search: %upcase(&recursive)"; output;
+   title="# of Target Files: &nFiles";output;
    title="# of Files Containg Search String: &nfound";  output;
-   title="Display Line Number in Target File: &displayLineNum"; output;
    title="Generation Date: &rundt"; output;
    title=" "; output;
-   title=repeat('#', 99); output;
+   title=repeat('#', 139); output;
    %do i = 1 %to 10;
      %if %length(&&searchStr&i) > 0 %then %do;
-       title="Search String &i("||"Regular Expression: &&_s_reg&i  "||"Case Sensitive: &&_s_case&i): "||&&_searchStr&i; 
+       title="Search String &i("||"Regular Expression: &&_s_reg&i  "
+             ||"Case Sensitive: &&_s_case&i): "||&&_searchStr&i; 
        output;
      %end;
      %if %length(&&excludeStr&i) > 0 %then %do;
-       title="Exclude String &i("||"Regular Expression: &&_e_reg&i  "||"Case Sensitive: &&_e_case&i): "||&&_excludeStr&i; 
+       title="Exclude String &i("||"Regular Expression: &&_e_reg&i  "
+             ||"Case Sensitive: &&_e_case&i): "||&&_excludeStr&i; 
        output;
      %end;
    %end;
-   title=repeat('#', 99); output;
+   title=repeat('#', 139); output;
    title=" "; output;
    title=" "; output;
 run;
@@ -398,7 +500,9 @@ run;
 option nodate nonumber ;
 title; footnote;
 ods _all_ close;
-option ps=80 ls=140;
+options ps=80 ls=140;
+options formchar = "|----|+|---+=|-/\<>*";
+options byline center;
 ods listing;
 proc print data=_title noobs split='~';
   var title;
@@ -410,12 +514,10 @@ run;
   proc sort data=matchFiles; by filewpath linenum; run;
   proc print data=matchFiles split= '~' noobs;
     by filewpath notsorted;
-     %if &displayLineNum=Y %then %do;
-       var linenum/style(column)=[just=l];
-    %end;
+    var linenum / style(column)=[just=l];
     var line;
-    format line %if &displayLineNum=Y %then %str($120.); %else %str($140.);;
-    label line = '~'  %if &displayLineNum=Y %then %str(linenum="~");;
+    format line $120.;
+    label line = '~'  linenum='~';
   run;
 %end;
 %else %do;
@@ -433,11 +535,3 @@ ods listing close;
 
 %mend strSearch;
 
-
-%strSearch( 
-  dir              = \\wilbtia\wilbtia02\GSK GSKING117175\BDRM\TLF
- ,filenamePattern  = ^v
- ,filetype         = sas
- ,includeSubFolder = N
- ,searchStr1       = "compress\(" Y
-);
